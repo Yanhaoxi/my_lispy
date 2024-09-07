@@ -1,9 +1,9 @@
-from typing import Generator, Union, TypeAlias
+from typing import Generator
 from analyze_eval import * 
 from fractions import Fraction
-
+from lisp_shell_config import MAX_IN, EVAL_TIME
 def interpret(
-    source: str, time: int, max_in: int = 100, eval_time: int|float  = 1
+    source: str, time: int, max_in: int = MAX_IN, eval_time: int|float  = EVAL_TIME, default_env:Environment= run_env
 ) -> tuple[str|None, str, set[str]]:
     """
     解释器入口:time为当前shell输入次数,max_in为最大输入长度,eval_time为最大运行次数
@@ -11,30 +11,30 @@ def interpret(
     """
     strgen = StrGen(source, max_in)
     tokengen = TokenGen(strgen, time)
-    try:
-        i=0
-        while i<eval_time:
+    i=0
+    while i<eval_time:
+        try:
             try:
                 exp=GenExp(tokengen)
             except EndOfSource:
                 # 表达式全部运行结束
                 break
-            result=eval(analyze(exp))
-            i+=1
-        
-        left=find_left(tokengen,source)
-        if result is not None:
-            return str(result),left,set(run_env.keys())
-        else:
-            return None,left,set(run_env.keys())
+            result=eval(analyze(exp),default_env)
+        except InterpretError as result:
+            result.display()
+            if isinstance(result,ExpError):
+                return None,'',set(run_env.keys())
+            else:
+                left=find_left(tokengen,source)
+                return None,left,set(run_env.keys())
+        i+=1
 
-    except InterpretError as result:
-        result.display()
-        if isinstance(result,ExpError):
-            return None,'',set(run_env.keys())
-        else:
-            left=find_left(tokengen,source)
-            return None,left,set(run_env.keys())
+    left=find_left(tokengen,source)
+    if result is not None:
+        return str(result),left,set(run_env.keys())
+    else:
+        return None,left,set(run_env.keys())
+
 
 def find_left(tokengen:Generator[Token,None,None],source:str)->str:
     try:    
@@ -149,14 +149,19 @@ def GenExp(tokengen: Generator[Token, None, None],slot:Token|None=None) -> Exp:
                 # 为了支持'(a b c)这种语法糖 将该表达式的前后位置定义为'与最后一个token的位置
                 next_token=next(tokengen)
                 next_exp=GenExp(tokengen,next_token)
-                new_token=Token('quote',token.location,token.where)
-                if isinstance(next_exp,Compound_):
-                    result=Compound_([Symbol_(new_token),next_exp],token.location,next_exp.end)
-                else:
-                    result=Compound_([Symbol_(new_token),next_exp],token.location,next_token.location)
-                
             except StopIteration:
                 raise UnmatchedQuote(token)
+            
+            new_token=Token('quote',token.location,token.where)
+            if isinstance(next_exp,Compound_):
+                tmp=Compound_([Symbol_(new_token),next_exp],token.location,next_exp.end)
+            else:
+                tmp=Compound_([Symbol_(new_token),next_exp],token.location,next_token.location)
+            if result is None:
+                result=tmp
+            else:
+                result.append(tmp)
+                
 
         else:
             # 对原子表达式解析  

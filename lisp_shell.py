@@ -4,18 +4,10 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.document import Document
-from prompt_toolkit.styles import Style
 from interpreter import interpret
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.shortcuts import print_formatted_text
-from prompt_toolkit.clipboard import ClipboardData
-
-# 定义 Scheme 关键字
-scheme_keywords = [
-    'if', 'begin', 'cond', 'lambda', 'define', 'set!', 'quote',
-    'car', 'cdr', 'list', 'and', 'or'
-]
-SPACENUM = 2
+from lisp_shell_config import scheme_keywords, SPACENUM, PARENTHESES_ADDED, SHELL_STYLE
 
 class DynamicKeywordCompleter(Completer):
     def __init__(self, keywords):
@@ -31,19 +23,18 @@ class DynamicKeywordCompleter(Completer):
             return  # 如果没有输入内容，不生成补全建议
         for keyword in sorted(self.keywords | self.additional_keywords):
             if keyword.startswith(word_before_cursor):
-                yield Completion(keyword, start_position=-len(word_before_cursor))
+                yield Completion(text=keyword, start_position=-len(word_before_cursor),display=keyword)
 
 # 创建关键字补全器
 keyword_completer = DynamicKeywordCompleter(set(scheme_keywords))
 
 # 创建键绑定
 bindings = KeyBindings()
-parentheses_added = False
 
 @bindings.add('(')
 def _(event):
     """在输入左括号时，自动补全右括号并将光标置于两者之间。"""
-    if parentheses_added:
+    if PARENTHESES_ADDED:
         event.current_buffer.insert_text('()')
         event.current_buffer.cursor_left()
     else:
@@ -149,11 +140,7 @@ def _(event):
 
 def interactive_shell():
     input_counter = 1
-    style = Style.from_dict({
-        'input': 'ansigreen',
-        'output': 'ansired',
-    })
-
+    style = SHELL_STYLE
     session = PromptSession(
         history=InMemoryHistory(),
         auto_suggest=AutoSuggestFromHistory(),

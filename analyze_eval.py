@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import NamedTuple, TypeAlias, NoReturn,Any,Iterable
+from typing import NamedTuple, TypeAlias, NoReturn,Any,Iterable,Generator
 from collections import UserList, ChainMap,UserString,deque
 from abc import ABC, abstractmethod
 from abc import ABC, abstractmethod
@@ -50,23 +50,46 @@ class Compound(UserList):
     def analysis(cls,exp:Compound)->Compound|None:
         return exp
     
-    def evaluate(self,env:Environment,exp_queue:list[Exp])->Atom:
+    def evaluate(self,env:Environment,exp_queue:list[Exp])->Atom|Environment:
         now_exp = self.data
         if not now_exp:
             return None
         first = eval(now_exp[0],env)
-        if (not isinstance(first, Procedure) and not isinstance(first, Operator)):
+        if not callable(first):
             raise LispTypeError('first element must be a procedure or operator',self)
         
-        ######################################
-        # 这个地方分类是因为以后可能引入惰性求值#
-        ######################################
-
+        other = iter(eval(i,env)for i in now_exp[1:])       
+        if isinstance(first, Procedure):
+            # 过程调用
+            if first.need_tail_optimization():
+                try:
+                    # 捕获过程中的错误
+                    env_new,last_body=first(other)
+                except Exception as e:
+                    if isinstance(e, LispError):
+                        # 传递错误，加入调用栈信息
+                        raise e(self)
+                    else:
+                        raise LispProcError(str(e),self) from None
+                # 尾递归优化
+                exp_queue.insert(0,last_body)
+                return env_new
+            else:
+                other = iter(eval(i,env)for i in now_exp[1:])            
+                try:
+                    # 捕获过程中的错误
+                    return first.no_tail_call(other) 
+                except Exception as e:
+                    if isinstance(e, LispError):
+                        # 传递错误，加入调用栈信息
+                        raise e(self)
+                    else:
+                        raise LispError(str(e),self) from None
         else:
-            other = [eval(i,env) for i in now_exp[1:]]
-            
+            other = iter(eval(i,env)for i in now_exp[1:])            
             try:
-                return first(*other)
+                # 捕获过程中的错误
+                return first(other) 
             except Exception as e:
                 if isinstance(e, LispError):
                     # 传递错误，加入调用栈信息
@@ -115,9 +138,9 @@ class If(Compound):
         
     def evaluate(self,env:Environment,exp_queue:list[Exp]):
         if eval(self.condition,env):
-            return exp_queue.insert(0,self.consequence)
+            exp_queue.insert(0,self.consequence)
         else:
-            return exp_queue.insert(0,self.alternative)
+            exp_queue.insert(0,self.alternative)
         
     def __str__(self):
         return f"(if {self.condition} {self.consequence} {self.alternative})"
@@ -149,38 +172,47 @@ class Cond(Compound):
     """(cond (<predicate1> <expression1>)
             (<predicate2> <expression2>)
             ...
-            (<predicateN> <expressionN>))"""
-    def __init__(self, clauses:list[tuple[Exp, Exp]]):
+            (else <expressionN>))"""
+    def __init__(self, clauses: list[tuple[Exp, Exp]]):
         self.clauses = clauses
 
     @classmethod
-    def analysis(cls, exp: Compound)->Cond|None:
+    def analysis(cls, exp: Compound) -> Cond | None:
         if len(exp) < 2:
             cls.raise_error(exp)
 
         clauses = []
         for clause in exp[1:]:
-            if isinstance(clause, Compound) and len(clause) == 2:
-                predicate = analyze(clause[0])
-                expression = analyze(clause[1])
-                clauses.append((predicate, expression))
+            if isinstance(clause, Compound):
+                # Check for 'else' clause
+                if len(clause) == 2 and isinstance(clause[0], Symbol) and clause[0] == 'else':
+                    if exp.index(clause) != len(exp) - 1:  # Ensure 'else' is the last clause
+                        cls.raise_error(clause,"Else clause must be the last one.")
+                    expression = analyze(clause[1])
+                    clauses.append((None, expression))  # None signifies the 'else' clause
+                    break  # Stop further clause processing after 'else'
+                elif len(clause) == 2:
+                    predicate = analyze(clause[0])
+                    expression = analyze(clause[1])
+                    clauses.append((predicate, expression)) #type:ignore
+                else:
+                    cls.raise_error(clause)
             else:
                 cls.raise_error(clause)
-        return Cond(clauses)
-    
+        return Cond(clauses)#type:ignore
 
-    def evaluate(self,env:Environment,exp_queue:list[Exp]):
+    def evaluate(self, env: Environment, exp_queue: list[Exp]):
         for predicate, expression in self.clauses:
-            if eval(predicate,env):
-                return exp_queue.insert(0,expression)
+            if predicate is None or eval(predicate, env):  # 'None' is for 'else' case
+                return exp_queue.insert(0, expression)
         return None
         
     def __str__(self):
         result = '(cond '
         for i in self.clauses:
-            result += f' ({i[0]} {i[1]})'
+            result += f' ({i[0] or "else"} {i[1]})'  # Use 'else' for the 'None' predicate
         return result + ')'
-            
+
     
 class Lambda(Compound):
     """(lambda (parameter1 parameter2 ... parameterN) body)"""
@@ -241,7 +273,7 @@ class Define(Compound):
             return Define(name, Lambda(parameters, body))
     
     def evaluate(self, env: Environment, exp_queue: list[Exp]):
-        env[self.name] = eval(self.value, env)
+        env[str(self.name)] = eval(self.value, env)
         return None
 
     def __str__(self):
@@ -292,9 +324,24 @@ class Quote(Compound):
     def __str__(self):
         return f"(quote {self.value})"
 
-    
+class Return(Compound):
+    """(return <expression>)"""
+    def __init__(self,value:Exp):
+        self.value = value
 
-COMPOUND:dict[str,type[Compound]]= {'if': If, 'begin': Begin, 'cond': Cond, 'lambda': Lambda, 'define': Define, 'set!': Set, 'quote': Quote}
+    @classmethod
+    def analysis(cls, exp: Compound) -> Return | None:
+        if len(exp) != 2:
+            cls.raise_error(exp)
+        return Return(exp[1])
+    
+    def evaluate(self, env: Environment, exp_queue: list[Exp]):
+        return eval(self.value, env)
+    
+    def __str__(self):
+        return f"(return {self.value})"
+
+COMPOUND:dict[str,type[Compound]]= {'if': If, 'begin': Begin, 'cond': Cond, 'lambda': Lambda, 'define': Define, 'set!': Set, 'quote': Quote, 'return': Return}
 def analyze(exp: Exp) -> Exp:
     if isinstance(exp, Compound):
         if isinstance(exp[0], Symbol) and exp[0] in COMPOUND:
@@ -329,78 +376,36 @@ class Procedure:
         self.body = body
         self.definition_env = env
 
-    def application_env(self, args: list[Exp]) -> Environment:
+    def application_env(self, args:list[Exp]) -> Environment:
         local_env = dict(zip(self.parms, args))
         return Environment(local_env, self.definition_env)
 
-    def __call__(self, *args: Exp) -> Any:
-        env = self.application_env(args)# type:ignore
+    def __call__(self, args: Generator[Exp,None,None]):
+        args_list = list(args)
+        if len(args_list) != len(self.parms):
+            raise LispTypeError(f'error arguments number')
+        
+        env = self.application_env(args_list)# type:ignore
+        for exp in self.body[:-1]:
+            eval(exp, env)
+        return (env, self.body[-1])
+    
+    def no_tail_call(self, args: Generator[Exp,None,None]):
+        args_list = list(args)
+        if len(args_list) != len(self.parms):
+            raise LispTypeError(f'error arguments number')
+        
+        env = self.application_env(args_list)
         for exp in self.body:
-            result = eval(exp, env)
+            result=eval(exp, env)
         return result
+    
+    def need_tail_optimization(self):
+        return not isinstance(self.body[-1], Return)
+        
     
     def __str__(self) -> str:
         return f'<procedure>'
-
-class Operator:
-    def __init__(self,op,num:tuple[int|None,int|None],type_gen:Iterable) -> None:
-        self.op = op
-        self.num = num
-        self.type_gen = type_gen
-
-    def __call__(self, *args) -> Any:
-        self.check(args)
-        return self.operate(*args)# type:ignore
-
-    def check(self, args) -> None:
-        if self.num[0] is not None and len(args) < self.num[0]:
-            raise LispTypeError(f'error arguments number')
-        if self.num[1] is not None and len(args) > self.num[1]:
-            raise LispTypeError(f'error arguments number')
-        if any(not isinstance(arg, type_) for arg, type_ in zip(args, self.type_gen)):
-            raise LispTypeError(f'error arguments type')
-        
-    def __str__(self) -> str:
-        return f'<operator:{self.op.__name__}>'
-
-    def __repr__(self) -> str:
-        return f'{self.__class__}:{self.op.__name__}'
-    
-class Sequential_Mixin():
-    """(+ 1 2 3)=> result=1+2,result=result+3"""
-    def operate(self, *args):
-        result = args[0]
-        for arg in args[1:]:
-            result = self.op(result, arg)
-        return result
-
-class Comparative_mixin():
-    """(> 1 2 3)=> and( 1>2, 1>3 )"""
-    def operate(self, *args):
-        first = args[0]
-        return all(self.op(first, arg) for arg in args[1:])
-
-class List_mixin():
-    """(list 1 2 3)=> list(1,2,3)"""
-    def operate(self, *args):
-        return self.op(args)
-    
-class One_mixin():
-    """(abs 1)=> abs(1)"""
-    def operate(self, *args):
-        return self.op(*args)
-    
-class S_OP(Operator,Sequential_Mixin):
-    pass
-
-class C_OP(Operator,Comparative_mixin):
-    pass
-
-class L_OP(Operator,List_mixin):
-    pass
-
-class O_OP(Operator,One_mixin):
-    pass
 
 def all_float():
     while True:
@@ -419,37 +424,188 @@ def all_object():
     while True:
         yield object
 
+def list_int_object():
+    yield Compound
+    yield int
+    yield object
+
+class Operator:
+    def __init__(self,op,num:tuple[int|None,int|None],type_gen=all_object) -> None:
+        self.op = op
+        self.num = num
+        self.type_gen = type_gen
+
+    def __call__(self, args:Generator[Exp,None,None]) -> Any:
+        args_list=list(args)
+        length = len(args_list)
+        if self.num[0] is not None and length < self.num[0]:
+            raise LispTypeError(f'error arguments number')
+        if self.num[1] is not None and length > self.num[1]:
+            raise LispTypeError(f'error arguments number')
+        return self.operate(args_list)# type:ignore
+    
+    def no_tail_call(self, args:Generator[Exp,None,None]) -> Any:
+        return self(args)
+
+    def __str__(self) -> str:
+        return f'<operator:{self.op.__name__}>'
+
+    def __repr__(self) -> str:
+        return f'{self.__class__}:{self.op.__name__}'
+    
+class Sequential_Mixin():
+    """
+    (+ 1 2 3)=> result=1+2,result=result+3
+    最少一个参数
+    """
+    def operate(self, args):
+        type_gen = self.type_gen()
+        result = args[0]
+        if not isinstance(result, next(type_gen)):
+            raise LispTypeError(f'error type')
+        for arg in args[1:]:
+            if not isinstance(arg, next(type_gen)):
+                raise LispTypeError(f'error type')
+            result = self.op(result, arg)
+        return result
+
+class Comparative_mixin():
+    """(> 1 2 3)=> and( 1>2, 1>3 )"""
+    def operate(self, args):
+        type_gen = self.type_gen()
+        first = args[0]
+        if not isinstance(first, next(type_gen)):
+            raise LispTypeError(f'error type')
+        for arg in args[1:]:
+            if not isinstance(arg, next(type_gen)):
+                raise LispTypeError(f'error type')
+            if not self.op(first, arg):
+                return False
+        return True
+
+class List_mixin():
+    """(list 1 2 3)=> list(1,2,3)"""
+    def operate(self, args):
+        type_gen = self.type_gen()
+        for arg in args:
+            if not isinstance(arg, next(type_gen)):
+                raise LispTypeError(f'error type')
+        return self.op(args)
+    
+class One_mixin():
+    """(abs 1)=> abs(1)"""
+    def operate(self, args):
+        type_gen = self.type_gen()
+        result = None
+        for arg in args:
+            if not isinstance(arg, next(type_gen)):
+                raise LispTypeError(f'error type')
+            result = self.op(arg)
+        return result
+    
+class And_OP(Operator):
+    def __init__(self):
+        pass
+    
+    def __call__(self, args:Generator[Exp,None,None]) -> Any:
+        return all( arg for arg in args)
+
+    def __str__(self) -> str:
+        return f'<operator:and>'
+    
+    def __repr__(self) -> str:
+        return str(self)
+
+class Or_OP(Operator):
+    def __init__(self):
+        pass
+
+    def __call__(self, args:Generator[Exp,None,None]) -> Any:
+        return any(arg for arg in args)
+    
+    def __str__(self) -> str:
+        return f'<operator:and>'
+    
+    def __repr__(self) -> str:
+        return str(self)
+
+class Map_OP(Operator):
+    def __init__(self):
+        pass
+
+    def __call__(self, args:Generator[Exp,None,None]) -> Any:
+        args_list= list(args)
+        if not callable(args_list[0]):
+            raise LispTypeError(f'first element must be a procedure or operator')
+        for arg in args_list[1:]:
+            if not isinstance(arg, Compound):
+                raise LispTypeError(f'map function must be operate on the list')
+        # 函数作用在参数迭代器上
+        func=args_list[0]
+        if isinstance(func, Procedure):
+            return Compound(map(func.no_tail_call,(iter(i) for i in zip(*args_list[1:]))))
+        else:
+            return Compound(map(args_list[0],(iter(i) for i in zip(*args_list[1:]))))
+    
+    def __str__(self) -> str:
+        return f'<operator:map>'
+    
+    def __repr__(self) -> str:
+        return str(self)
+
+class Func():
+    @staticmethod
+    def set_ref(arg:list):
+        arg[0][arg[1]]=arg[2]
+
+class S_OP(Operator,Sequential_Mixin):
+    pass
+
+class C_OP(Operator,Comparative_mixin):
+    pass
+
+class L_OP(Operator,List_mixin):
+    pass
+
+class O_OP(Operator,One_mixin):
+    pass
+
+
 def standard_env() -> Environment:
     env = Environment()
-    env.update(vars(math))   # sin, cos, sqrt, pi, ...
+    # env.update(vars(math))   # sin, cos, sqrt, pi, ...
     env.update({
-            '+': S_OP(op.add,(2,None),all_float()),
-            '-': S_OP(op.sub,(2,None),all_float()),
-            '*': S_OP(op.mul,(2,None),all_float()),
-            '/': S_OP(op.truediv,(2,None),all_float()),
-            'quotient': S_OP(op.floordiv,(2,None),all_float()),
-            '>': C_OP(op.gt,(2,None),all_float()),
-            '<': C_OP(op.lt,(2,None),all_float()),
-            '>=': C_OP(op.ge,(2,None),all_float()),
-            '<=': C_OP(op.le,(2,None),all_float()),
-            '=': C_OP(op.eq,(2,None),all_float()),
-            'abs': O_OP(abs,(1,1),all_float()),
-            'append': S_OP(op.add,(2,None),one_list()),
-            'car': O_OP(lambda x: x[0],(1,1),one_list()),
-            'cdr': O_OP(lambda x: Compound(x[1:]),(1,1),one_list()),
-            'eq?': C_OP(op.is_,(2,None),all_object()),
-            'equal?': C_OP(op.eq,(2,None),all_object()),
-            'length': O_OP(len,(1,1),one_list()),
-            'list': L_OP(Compound,(0,None),all_object()),
-            'list?': C_OP(lambda x: isinstance(x, Compound),(1,None),all_object()),
-            'max': L_OP(max,(1,None),all_float()),
-            'min': L_OP(min,(1,None),all_float()),
-            'not': O_OP(lambda x: x is False and False or True,(1,1),all_object()),
-            'empty?': O_OP(lambda x: x == [],(1,1),one_list()),
-            'number?': C_OP(lambda x: isinstance(x, (int, float)),(1,None),all_object()),
-            'procedure?': C_OP(callable,(1,None),all_object()),
-            'symbol?': C_OP(lambda x: isinstance(x, Symbol),(1,None),all_object()),
-            'cons': S_OP(lambda x,y: Compound([x]+y),(2,2),one_list_end()),
+            '+': S_OP(op.add,(2,None),all_float),
+            '-': S_OP(op.sub,(2,None),all_float),
+            '*': S_OP(op.mul,(2,None),all_float),
+            '/': S_OP(op.truediv,(2,None),all_float),
+            'quotient': S_OP(op.floordiv,(2,None),all_float),
+            '>': C_OP(op.gt,(2,None),all_float),
+            '<': C_OP(op.lt,(2,None),all_float),
+            '>=': C_OP(op.ge,(2,None),all_float),
+            '<=': C_OP(op.le,(2,None),all_float),
+            '=': C_OP(op.eq,(2,None),all_float),
+            'abs': O_OP(abs,(1,1),all_float),
+            'append': S_OP(op.add,(2,None),one_list),
+            'car': O_OP(lambda x: x[0],(1,1),one_list),
+            'cdr': O_OP(lambda x: Compound(x[1:]),(1,1),one_list),
+            'eq?': C_OP(op.is_,(2,None)),
+            'equal?': C_OP(op.eq,(2,None)),
+            'length': O_OP(len,(1,1),one_list),
+            'list': L_OP(Compound,(0,None)),
+            'list?': C_OP(lambda x: isinstance(x, Compound),(1,None)),
+            'max': L_OP(max,(1,None),all_float),
+            'min': L_OP(min,(1,None),all_float),
+            'not': O_OP(lambda x: not x,(1,1)),
+            'empty?': O_OP(lambda x: x == [],(1,1),one_list),
+            'number?': C_OP(lambda x: isinstance(x, (int, float)),(1,None)),
+            'procedure?': C_OP(callable,(1,None)),
+            'symbol?': C_OP(lambda x: isinstance(x, Symbol),(1,None)),
+            'cons': S_OP(lambda x,y: Compound([x]+y),(2,2),one_list_end),
+            'map': Map_OP(),
+            'and': And_OP(),
+            'or': Or_OP(),
+            'set-ref!': L_OP(Func.set_ref,(3,3),list_int_object),
     })
     return env
 
@@ -463,6 +619,9 @@ def eval(exp: Exp,env=run_env) -> Atom:
         exp=exp_queue.pop(0)
         if isinstance(exp, Compound):
             result= exp.evaluate(env,exp_queue)
+            # 尾递归优化，传递的是新的环境
+            if isinstance(result, Environment):
+                env=result
         else:
             if isinstance(exp, Symbol):
                 try:
@@ -471,21 +630,17 @@ def eval(exp: Exp,env=run_env) -> Atom:
                     raise LispNameError(f'undefined variable {exp}',exp)
             else:
                 result= exp #type:ignore
-    return result
+    return result #type:ignore
     
 #####################################################################################################
 #                                             Error                                                 #
 #####################################################################################################
 
 from prompt_toolkit import HTML
-from prompt_toolkit.styles import Style
 from prompt_toolkit.shortcuts import print_formatted_text
+from lisp_shell_config import ERROR_STYLE
 # 定义样式
-style = Style.from_dict({
-    'input': 'ansigreen',
-    'keyword': 'ansiyellow',
-    'error': 'ansired',
-})
+style = ERROR_STYLE
 
 
 class InterpretError(Exception):
