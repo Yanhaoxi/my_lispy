@@ -1,5 +1,5 @@
 ## 前言
-在看完《流畅的python》lispy(一个python写的lisp语言解释器)后，对lisp语言突然饶有兴趣，让我想到了之前那时觉得并不好看的《计算机程序的构造和解释》，于是捡着感兴趣的部分（前四章）了解了下lisp语言设计思想，自己写了一个lisp解释器（虽然一开始以为是一个轻松的工作但是还是才了不少坑重构了好几次）
+在看完《流畅的python》lispy(一个python写的lisp语言解释器)后，对lisp语言突然饶有兴趣，让我想到了之前那时觉得并不好看的《计算机程序的构造和解释》，于是捡着感兴趣的部分（前四章）了解了下lisp语言设计思想，自己写了一个lisp解释器（虽然一开始以为是一个轻松的工作但是还是踩了不少坑重构了好几次）
 
 # 程序语言的构造与解释
 ## 程序语言的构造
@@ -8,16 +8,16 @@
 ### Atom 原子表达式
 #### 符号（Symbol）：
 可以作为一个程序对象的别名  
-（解释器中：Symbol:TypeAlias=UserString）
+（解释器内的实现：Symbol:TypeAlias=UserString）
 
 #### 数字（Number）：
 可以以整数，浮点数，分数的形式输入，这些都可以被解析  
-(解释器中：Number:TypeAlias=int|float)
+(解释器内的实现：Number:TypeAlias=int|float)
 
 #### 布尔值（Boolean）
 ```#t```为真，```#f```为假  
 0的值与 #f 相等，但是指向的对象不一致  
-即：
+有：
 ```
 In [1]:(eq? #f 0)
 Out[1]:False
@@ -49,45 +49,49 @@ Out[2]:True
 接受参数返回结果的函数 **（本项目的实际实现中是将参数作为迭代器进行传递的，这样可以把参数是否直接计算的逻辑延迟到实际执行中，如and,or的最短计算原则依赖此原则实现）**  
 （解释器中，用户定义的类型为procedure，内置的过程类型为operator,但是由callable可以作统一判断）
 #### 基本过程
-语言内置的、无法再进一步分解的最基本的函数。  
-**注**：由于基本为一句话函数，所以均没有尾递归优化。
-##### 算术运算 **(具有参数检查在接受非Number对象时会报错)**
-- +: 加法运算符。接受两个或多个数值参数，返回它们的和。
-- -: 减法运算符。接受两个或多个数值参数，返回它们的差。
-示例: (- 10 3 2) 返回 5。
-- *: 乘法运算符。接受两个或多个数值参数，返回它们的积。
-- /: 除法运算符。接受两个或多个数值参数，返回它们的商。
-- quotient: 整数除法运算符。接受两个或多个数值参数，返回它们的整数商。
+语言内置的、无法再进一步分解的最基本的函数，由于基本为一句话函数，所以均**没有尾递归优化**。   
+在解释器中对于基本过程主要由两部分构成:
+- 具有**operate**方法的Mixin类
+- 传入的用于参数检测的生成器函数  
+举一个具体的内置基本过程实现的例子：
+```python
+'+': S_OP(op.add,(2,None),all_float)
+# 第一个参数提供了将要被应用的函数
+# 第二个参数是参数数量的限制（None是指无上限or下限）
+# 第三个参数是用来进行参数检测的生成器函数
 
-##### 比较运算 **(具有参数检查在接受非Number对象时会报错)**
-- \>: 大于运算符。接受两个或多个数值参数，如果第一个参数大于后面的所有参数，则返回 True，否则返回 False。
-- <: 小于运算符。接受两个或多个数值参数，如果第一个参数小于后面的所有参数，则返回 True，否则返回 False。
-- \>=: 大于等于运算符。接受两个或多个数值参数，如果第一个参数大于等于后面的所有参数，则返回 True，否则返回 False。
-- <=: 小于等于运算符。接受两个或多个数值参数，如果第一个参数小于等于后面的所有参数，则返回 True，否则返回 False。
-- =: 等于运算符。接受两个或多个数值参数，如果所有参数相等，则返回 True，否则返回 False。
+class S_OP(Operator,Sequential_Mixin):
+    pass
 
-##### 其他数值运算 **(具有参数检查在接受非Number对象时会报错)**
-- abs: 绝对值函数。接受一个数值参数，返回其绝对值。
-- max: 最大值函数。接受一个或多个数值参数，返回其中的最大值。
-- min: 最小值函数。接受一个或多个数值参数，返回其中的最小值。
+class Operator:
+    def __init__(self,op,num:tuple[int|None,int|None],type_gen=all_object) -> None:
+        self.op = op
+        self.num = num
+        self.type_gen = type_gen
 
-##### 逻辑运算 **（接受任何参数）**
-- and: 逻辑与运算符。接受零个或多个参数，如果所有参数都为 True，则返回 True，否则返回 False。
-- or: 逻辑或运算符。接受零个或多个参数，如果至少有一个参数为 True，则返回 True，否则返回 False。
-- not: 逻辑非运算符。接受一个参数，如果参数为 False，则返回 True，否则返回 False。
+    def __call__(self, args:Generator[Exp,None,None]):
+        # 进行参数数量的检查
+        return self.operate(args_list)
 
-##### 检测 **（接受任何参数）**
-- eq?: 对象相等检测函数。接受两个或多个参数，如果所有参数是同一个对象，则返回 True，否则返回 False。
-- equal?: 值相等检测函数。接受两个或多个参数，如果所有参数的值相等，则返回 True，否则返回 False。
-- number?: 数值检测函数。接受一个参数，如果参数是数值类型，则返回 True，否则返回 False。
-- procedure?: 过程检测函数。接受一个参数，如果参数是可调用的过程，则返回 True，否则返回 False。
-**虽然在实际实现中，内置函数与用户定义函数不是一个类型但是该操作符是基于callable定义的**
-- symbol?: 符号检测函数。接受一个参数，如果参数是符号类型，则返回 True，否则返回 False。
+class Sequential_Mixin():
+    """
+    (+ 1 2 3)=> result=1+2,result=result+3
+    最少一个参数
+    """
+    def operate(self, args):
+        type_gen = self.type_gen()
+        result = args[0]
+        if not isinstance(result, next(type_gen)):
+            raise LispTypeError(f'error type')
+        for arg in args[1:]:
+            if not isinstance(arg, next(type_gen)):
+                raise LispTypeError(f'error type')
+            result = self.op(result, arg)
+        return result
+```
+**注**：and,or由于无需计算所有参数，以及map函数较为复杂（因为为了运行效率和更好的报错信息，map作用的函数是关闭尾递归优化的）他们是直接单独实现的，但是都是operate的子类
 
-##### 高阶函数 **(具有参数检查，接受一个函数和若干列表作为参数)**
-- map: 映射函数。接受一个函数和一个或多个列表参数，返回一个新列表，其中每个元素是函数作用在对应列表元素上的结果。  
-**注**：为了效率，在实现中被映射函数的尾递归会被关闭
-示例: (map + '(1 2 3) '(4 5 6)) 返回 (5 7 9)。
+在源码的standard_env里记录了所有的内置函数（可见analyze_eval.py文件）
 
 #### 复合过程
 由基本过程或其他复合过程通过组合而构成的新的过程（用户定义的都为复合过程）  
@@ -241,7 +245,7 @@ def analyze(exp: Exp) -> Exp:
     else:
         return exp
 ```
-**注**：analyze是一个递归解析的过程，他会依次解析到Atom为止，唯一的例外是Quote类，对于（quote exp）的exp将不被继续解析下去，这与quote作用的表达式维持字面含义是保持一致的（这也与(quote exp)作为eval参数时须经anlyze保持一致）
+**注**：analyze是一个递归解析的过程，他会依次解析到Atom为止，唯一的例外是Quote类，对于（quote exp）的exp将不被继续解析下去，这与quote作用的表达式维持字面含义是保持一致的（同时这与(quote exp)作为eval参数时须经anlyze保持一致）
 ```python
 class Quote(Compound):
 @classmethod
@@ -254,3 +258,24 @@ class Quote(Compound):
 
 ### eval
 该解释器的核心模块
+#### 流程图
+![eval流程](./png/屏幕截图%202024-09-09%20181023.png)
+其中句式类（如：Quote,If等他们都是继承了Compound的子类并且重写了evaluate方法逻辑较为简单，可以自行源码查看）  
+由于图比较复杂，以下是一些文字注解：  
+- 首先调用eval函数（传入exp,env作为参数）
+- exp被传入exp_queue，env作为environmet
+- 如果exp_queue为空则直接返回结果，不为空则pop出一个exp
+    - exp为numbol/bool，则直接计算出值给result
+    - exp为symbol时则在Environment中查找，若是没有找到则抛出LispnameError
+    - exp为Compound时则将exp_queue、exp、Environment作为参数传递给Compound的evaluate函数调用，如果返回的是一个环境则更改环境，若不是则将值给result
+
+- 对于Compound.evaluate，exp被分为first与other，其中first为Procedure类的实例，具有函数体与函数参数。
+- 通过procedure的body最后一句是不是Return句式类来判断是否需要尾递归优化，如果需要则调用```procedure.__call__```，如果不需要则调用```procedure.no_tail_call```，并以other作为参数
+- 将other映射到Producer类的arg上形成New_Env，并与之前的Environment形成链式结构（chainmap）作为Func_Environment
+    - ```procedure.__call__```，以Func_Environment作为环境，依次执行函数体最后返回结果
+    - ```procedure.no_tail_call```，以Func_Environment作为环境，依次执行函数体，并将最后一句函数体返回到传进来的exp_queue中，返回Environment作为result
+- 其中对于以上两个过程抛出的error，如果是LispError则当前的exp信息加入形成call-stack形式的报错信息，如果不是LispError，则将其包装成LispError作为第一层报错使之更加模块化
+
+## test模块
+大部分沿用了lispy的检查（更改了一些接口），加入了一些对于该项目才有的特性的test样例
+
